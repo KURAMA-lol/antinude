@@ -3,7 +3,7 @@ os.environ["ORT_NO_OPENCL"] = "1"
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 from flask import Flask, request, jsonify
 import tempfile, os, traceback, logging
-from PIL import Image
+from PIL import Image, ImageOps
 try:
     from nudenet import NudeDetector
 except Exception:
@@ -11,7 +11,7 @@ except Exception:
 
 
 SEXUAL_ACT_THRESHOLD = 0.55  
-LABEL_CONFIDENCE_MIN = 0.40  
+LABEL_CONFIDENCE_MIN = 0.20  
 MAX_UPLOAD_BYTES = 80 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -30,21 +30,61 @@ except Exception:
     logging.exception("Failed to instantiate NudeDetector")
     raise
 def try_model_methods(path):
-    """Try several method names on the NudeNet instance and return (result, method_name)."""
-    candidates = ['predict','classify','detect','classify_image','predict_image','predict_file','classify_files','__call__']
-    last_exc = None
-    for name in candidates:
-        if hasattr(model, name):
-            func = getattr(model, name)
+    """Run NudeNet on the full image and overlapping crops, merging by label."""
+    if not hasattr(model, "detect"):
+        raise RuntimeError("Installed NudeNet detector has no detect() method")
+
+    crop_paths = []
+    try:
+        with Image.open(path) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            width, height = image.size
+            boxes = []
+
+            # The full image is always checked. Overlapping crops give the 320px
+            # model a closer view of smaller subjects in high-resolution images.
+            if width >= 640 and height >= 640:
+                crop_width = max(320, int(width * 0.62))
+                crop_height = max(320, int(height * 0.62))
+                x_starts = sorted({0, max(0, width - crop_width)})
+                y_starts = sorted({0, max(0, height - crop_height)})
+                for y in y_starts:
+                    for x in x_starts:
+                        box = (x, y, min(width, x + crop_width), min(height, y + crop_height))
+                        if box != (0, 0, width, height):
+                            boxes.append(box)
+            elif max(width, height) >= 640:
+                if width >= height:
+                    crop_width = max(320, int(width * 0.62))
+                    for x in sorted({0, max(0, width - crop_width)}):
+                        boxes.append((x, 0, min(width, x + crop_width), height))
+                else:
+                    crop_height = max(320, int(height * 0.62))
+                    for y in sorted({0, max(0, height - crop_height)}):
+                        boxes.append((0, y, width, min(height, y + crop_height)))
+
+            for box in boxes:
+                crop = image.crop(box)
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                crop_paths.append(tmp.name)
+                tmp.close()
+                crop.save(crop_paths[-1], format="JPEG", quality=95)
+
+        detections = []
+        for image_path in [path] + crop_paths:
+            result = model.detect(image_path)
+            if not isinstance(result, list):
+                raise RuntimeError("NudeNet detect() returned an unexpected result")
+            detections.extend(result)
+
+        return detections, ("detect_multiscale" if crop_paths else "detect")
+    finally:
+        for crop_path in crop_paths:
             try:
-                logging.info("Attempting model.%s on %s", name, path)
-                res = func(path)
-                logging.info("model.%s succeeded", name)
-                return res, name
-            except Exception as e:
-                logging.exception("model.%s failed", name)
-                last_exc = e
-    raise RuntimeError(f"No model method succeeded. Last: {last_exc}")
+                if os.path.exists(crop_path):
+                    os.remove(crop_path)
+            except Exception:
+                logging.exception("Failed to remove temporary crop")
 
 def normalize_score_entry(entry):
     if entry is None:
@@ -123,31 +163,18 @@ def extract_labels_from_result(result):
     return out
 
 def label_means_exposed_nude(lbl):
-    """
-    HOW THE ALGORITHM CHECKS:
-     - For WOMEN: exposed breasts/areola/nipple OR exposed genitals -> positive
-     - For MEN: male breast/torso exposures are NOT positive; only exposed male genitals (penis) -> positive
-     - Sexual act labels (oral, blowjob, sex, intercourse, etc.) -> positive
-    This function operates on normalized lowercased label strings.
-    """
+    """Return True only for NudeNet classes representing exposed intimate areas."""
     if not lbl:
         return False
+    exposed_classes = {
+        "FEMALE_BREAST_EXPOSED",
+        "FEMALE_GENITALIA_EXPOSED",
+        "MALE_GENITALIA_EXPOSED",
+        "BUTTOCKS_EXPOSED",
+        "ANUS_EXPOSED",
+    }
+    return lbl.strip().upper() in exposed_classes
 
-    l = lbl.lower()
-    if any(tok in l for tok in ('covered', 'cover', 'bra', 'underwear', 'bikini', 'swimsuit', 'shirt', 'clothe', 'dressed')):
-        return False
-    sexual_tokens = ['oral', 'blowjob', 'fellatio', 'sucking', 'cunnilingus', 'sex', 'intercourse', 'penetration', 'masturbation', 'porn', 'cum']
-    if any(tok in l for tok in sexual_tokens):
-        return True
-    if 'penis' in l or 'male_genital' in l or 'male_genitalia' in l:
-        return True
-    if ('vagina' in l or 'pussy' in l or 'female_genital' in l or 'female_genitalia' in l or 'labia' in l) and ('expos' in l or 'exposed' in l or 'visible' in l or 'open' in l):
-        return True
-    if any(tok in l for tok in ('female_breast_exposed', 'female_nipple_exposed', 'areola', 'areola_exposed')):
-        return True
-    if 'female' in l and any(tok in l for tok in ('breast', 'nipple', 'areola')) and any(tok in l for tok in ('expos', 'exposed', 'visible', 'bare')):
-        return True
-    return False
 @app.route("/", methods=['GET'])
 def index():
     return jsonify({'status': 'ok', 'message': 'exlipt Exposure'})
@@ -171,8 +198,14 @@ def check_image():
         try:
             model_result, method_used = try_model_methods(temp_path)
         except Exception as e:
-            logging.exception("Model call failed; returning safe by default")
-            return jsonify({'status': 'ok', 'verdict': 'safe', 'scores': {'safe': 1.0, 'unsafe': 0.0}, 'debug': {'method_error': str(e)}}), 200
+            logging.exception("NudeNet inference failed; refusing to classify the image as safe")
+            return jsonify({
+                'status': 'error',
+                'message': 'inference_failed',
+                'verdict': 'review',
+                'scores': {'safe': 0.0, 'unsafe': 0.0},
+                'debug': {'method_error': str(e)}
+            }), 503
         labels = extract_labels_from_result(model_result)
         debug_labels = [{'label': l, 'confidence': c} for (l, c) in labels]
 
